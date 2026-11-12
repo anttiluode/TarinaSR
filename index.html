@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TärinäSR</title>
+<style>
+  :root {
+    --bg: #0f1114; --panel: #171a1f; --line: #2a2f37; --text: #e8e6e1; --dim: #9a9890;
+    --accent: #f2b544; --ring: #6fd3c2; --bad: #e0715f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 40px; }
+  h1 { font-size: 26px; margin: 4px 0 2px; letter-spacing: .5px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 14px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+  button, label.btn, select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 12px; font: inherit; cursor: pointer; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=file] { display: none; }
+  .views { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .view { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px; min-width: 0; }
+  .view h2 { font-size: 13px; font-weight: 600; margin: 0 0 6px; color: var(--dim); display: flex; justify-content: space-between; gap: 6px; }
+  .view h2 b { color: var(--text); font-weight: 600; }
+  .view canvas { width: 100%; display: block; border-radius: 6px; background: #000; image-rendering: pixelated; cursor: crosshair; }
+  .lower { display: grid; grid-template-columns: 220px 1fr; gap: 10px; margin-top: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .card h3 { margin: 0 0 6px; font-size: 13px; color: var(--dim); font-weight: 600; }
+  #phase { width: 196px; height: 196px; display: block; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 14px; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--dim); font-size: 12px; }
+  .stat .v { font-size: 18px; }
+  .stat .v.big { color: var(--ring); }
+  .meter { height: 6px; background: #0b0c0e; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+  .meter i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+  .note { color: var(--dim); font-size: 13px; margin-top: 14px; }
+  .note b { color: var(--text); }
+  #msg { color: var(--accent); min-height: 1.5em; }
+  video { display: none; }
+  @media (max-width: 760px) {
+    .views { grid-template-columns: 1fr; }
+    .lower { grid-template-columns: 1fr; }
+    #phase { margin: 0 auto; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tärinä<span>SR</span></h1>
+  <p class="sub">Shake becomes resolution. Every shaky frame samples the scene at slightly different points. A ring of the last 16 frames
+    keeps writing back what each one says the picture got wrong, until the frames stop disagreeing.</p>
+
+  <div class="bar">
+    <button id="mDemo" class="on">Demo shake</button>
+    <button id="mCam">Camera</button>
+    <label class="btn" for="fVid">Video file</label><input id="fVid" type="file" accept="video/*">
+    <label class="btn" for="fImg">Demo with your image</label><input id="fImg" type="file" accept="image/*">
+    <span style="flex:1"></span>
+    <select id="lens" title="How blurry the camera's lens is, in high-res pixels. The ring undoes what it is told."><option value="0">lens: sharp</option><option value="0.5">lens 0.5</option><option value="0.7">lens 0.7</option><option value="0.9">lens 0.9</option></select>
+    <select id="zoom"><option value="1">zoom 1×</option><option value="2" selected>zoom 2×</option><option value="4">zoom 4×</option></select>
+    <button id="bFreeze">Freeze</button>
+    <button id="bReset">Reset</button>
+    <button id="bSave">Save</button>
+  </div>
+  <div id="msg"></div>
+
+  <div class="views">
+    <div class="view"><h2><b>One frame</b><span>first frame, SihtiSR ×2</span></h2><canvas id="cOne"></canvas></div>
+    <div class="view"><h2><b>The ring</b><span id="ringLbl">16 shaky frames ×2</span></h2><canvas id="cRing"></canvas></div>
+    <div class="view"><h2><b>What the ring wrote</b><span>ring − one frame, ×6</span></h2><canvas id="cRes"></canvas></div>
+  </div>
+
+  <div class="lower">
+    <div class="card">
+      <h3>Sub-pixel phases in the ring</h3>
+      <canvas id="phase" width="392" height="392"></canvas>
+      <div class="meter"><i id="cover"></i></div>
+      <div class="stat"><span class="k">phase coverage</span></div>
+    </div>
+    <div class="card">
+      <div class="stats">
+        <div class="stat"><div class="k">frames written</div><div class="v" id="sFrames">0</div></div>
+        <div class="stat"><div class="k">frames skipped</div><div class="v" id="sSkip">0</div></div>
+        <div class="stat"><div class="k">last shift (high-res px)</div><div class="v" id="sShift">–</div></div>
+        <div class="stat"><div class="k">last rotation</div><div class="v" id="sRot">–</div></div>
+        <div class="stat"><div class="k">what the ring still writes</div><div class="v" id="sRes">–</div></div>
+        <div class="stat"><div class="k">speed</div><div class="v" id="sFps">–</div></div>
+        <div class="stat demo"><div class="k">bicubic, one frame</div><div class="v" id="pBic">–</div></div>
+        <div class="stat demo"><div class="k">SihtiSR, one frame</div><div class="v" id="pOne">–</div></div>
+        <div class="stat demo"><div class="k">TärinäSR ring</div><div class="v big" id="pRing">–</div></div>
+      </div>
+      <p class="note" id="howto"></p>
+    </div>
+  </div>
+
+  <p class="note"><b>What this is.</b> Multi-frame super-resolution: register every frame against the first (phase correlation, then
+    Lucas–Kanade for shift and a small rotation), keep the last 16 in a ring, and on each new frame visit four of them and add back
+    <i>frame − shrink(warp(estimate))</i>. The start is SihtiSR on the first frame. The same idea is Irani &amp; Peleg (1991), and Google's
+    Pixel phones do it with hand tremor (Wronski et al., 2019). This is a small, readable version. <b>Limits:</b> it assumes the scene is
+    still and the camera moves rigidly; moving objects smear. A camera on a desk does not shake, so pick the phone up. Phone video is already
+    sharpened and compressed, so real gains are smaller than in the demo, where the numbers above are measured against the true image.
+    <a href="https://github.com/anttiluode/TarinaSR" style="color:var(--ring)">Code, benchmark and tests</a>.</p>
+</main>
+<video id="vid" playsinline muted></video>
+<script src="model.js"></script>
+<script src="sihti.js"></script>
+<script src="tarina.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
