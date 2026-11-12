@@ -1,5 +1,7 @@
 # TärinäSR: shake becomes resolution
 
+EDIT: Added tarina_gui.py - python version of the web page by gemini argon. 
+
 **[Try it](https://anttiluode.github.io/TarinaSR/)**: a demo with a known picture, your phone camera, or a handheld video file.
 
 ![one crop four ways](results/crops.png)
