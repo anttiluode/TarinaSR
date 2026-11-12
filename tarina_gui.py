@@ -1,4 +1,4 @@
-"""tarina_gui.py — Native Python Desktop GUI for TarinaSR.
+"""tarina_gui.py — Native Python Desktop GUI for TarinaSR (with True ×2 GIF / Burst Mode).
 
 Place in the root of the TarinaSR repository (next to tarina.py, sihtisr.py, model.json).
 Requires: pip install numpy opencv-python pillow
@@ -16,7 +16,7 @@ from tkinter import filedialog, ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageSequence, ImageTk
 
 import sihtisr
 import tarina
@@ -27,7 +27,22 @@ MARGIN = 24
 DEMO_FRAMES = 200
 
 
-# ---------- Dynamic module adapters (handles any function naming in sihtisr.py) ----------
+def make_border_feather(h: int, w: int, pad: int = 16) -> np.ndarray:
+    """Smooth cosine feather mask so rotated frames never stamp rectangular box edges."""
+    wy = np.ones(h, dtype=np.float64)
+    wx = np.ones(w, dtype=np.float64)
+    ramp = 0.5 * (1.0 - np.cos(np.linspace(0.0, math.pi, pad)))
+    wy[:pad] = ramp
+    wy[-pad:] = ramp[::-1]
+    wx[:pad] = ramp
+    wx[-pad:] = ramp[::-1]
+    return np.outer(wy, wx)
+
+
+FEATHER_HR = make_border_feather(HH, HW, pad=20)
+
+
+# ---------- Dynamic module adapters ----------
 def call_bicubic_up(y: np.ndarray) -> np.ndarray:
     for name in ("bicubic_up", "bicubic", "up_bicubic"):
         fn = getattr(sihtisr, name, None)
@@ -43,22 +58,18 @@ def call_bicubic_up(y: np.ndarray) -> np.ndarray:
 
 
 def _builtin_sihti_up(y: np.ndarray, model: dict) -> np.ndarray:
-    """Direct NumPy implementation of the 216-bucket SihtiSR model.json lookup."""
     h, w = y.shape
-    W = np.asarray(model["W"], dtype=np.float64)  # shape (216, 25, 4)
+    W = np.asarray(model["W"], dtype=np.float64)
     sthr = model["sthr"]
     coh_thr = model["coh"]
     na, ns, nc = int(model["na"]), int(model["ns"]), int(model["nc"])
 
     pad = np.pad(y, 2, mode="edge")
-    # 5x5 patches for every pixel: shape (h, w, 25)
     patches = np.lib.stride_tricks.sliding_window_view(pad, (5, 5)).reshape(h, w, 25)
 
-    # 3x3 Sobel-like gradients for bucket sorting
     gy = pad[2 : h + 2, 1 : w + 1] - pad[0:h, 1 : w + 1]
     gx = pad[1 : h + 1, 2 : w + 2] - pad[1 : h + 1, 0:w]
 
-    # Structure tensor over 3x3 window
     gxx = cv2.boxFilter(gx * gx, -1, (3, 3), normalize=True)
     gyy = cv2.boxFilter(gy * gy, -1, (3, 3), normalize=True)
     gxy = cv2.boxFilter(gx * gy, -1, (3, 3), normalize=True)
@@ -76,13 +87,11 @@ def _builtin_sihti_up(y: np.ndarray, model: dict) -> np.ndarray:
     ba = np.clip((angle / math.pi * na).astype(np.int32), 0, na - 1)
     bs = (strength >= sthr[0]).astype(np.int32) + (strength >= sthr[1]).astype(np.int32)
     bc = (coherence >= coh_thr[0]).astype(np.int32) + (coherence >= coh_thr[1]).astype(np.int32)
-    bucket = (ba * ns + bs) * nc + bc  # (h, w) in 0..215
+    bucket = (ba * ns + bs) * nc + bc
 
-    # Apply per-bucket 25x4 filter
-    filters = W[bucket]  # (h, w, 25, 4)
-    quads = np.einsum("hwk,hwkc->hwc", patches, filters)  # (h, w, 4)
+    filters = W[bucket]
+    quads = np.einsum("hwk,hwkc->hwc", patches, filters)
 
-    # Exact Sihti 2x2 downsample conservation lock
     mean_err = y - np.mean(quads, axis=-1)
     quads = quads + mean_err[..., None]
 
@@ -95,7 +104,6 @@ def _builtin_sihti_up(y: np.ndarray, model: dict) -> np.ndarray:
 
 
 def call_sihti_up(y: np.ndarray, model: dict) -> np.ndarray:
-    # 1. Check if tarina.py already exposes the starter upscale helper
     for mod in (sihtisr, tarina):
         for name in (
             "sihti_up",
@@ -129,7 +137,6 @@ def call_sihti_up(y: np.ndarray, model: dict) -> np.ndarray:
                         pass
                 except Exception:
                     pass
-    # 2. Fallback to built-in 216-bucket lookup
     return _builtin_sihti_up(y, model)
 
 
@@ -141,7 +148,6 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def make_chart_truth() -> np.ndarray:
-    """Generate the Siemens star + shrinking text + line-pair test chart (480x360)."""
     im = Image.new("L", (HW, HH), color=214)
     dr = ImageDraw.Draw(im)
 
@@ -225,6 +231,12 @@ class TarinaGUI:
         self.skipped = 0
         self.misses = 0
         self.cap: cv2.VideoCapture | None = None
+
+        # Native 1:1 GIF / Burst stack state (never downscaled!)
+        self.burst_full_frames: list[np.ndarray] = []
+        self.burst_crop_origin = [0, 0]  # [y0, x0] in original GIF/burst coordinates
+        self.burst_idx = 0
+
         self.fps_t = time.perf_counter()
         self.fps_n = 0
 
@@ -241,25 +253,39 @@ class TarinaGUI:
 
         tk.Label(
             top,
-            text="TarinaSR (Python Engine)",
+            text="TarinaSR (Python)",
             fg="#f2b544",
             bg="#0f1114",
-            font=("Segoe UI", 16, "bold"),
-        ).pack(side=tk.LEFT, padx=(0, 16))
+            font=("Segoe UI", 15, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
-        btn_cfg = dict(bg="#171a1f", fg="#e8e6e1", activebackground="#2a2f37", relief=tk.FLAT, padx=10, pady=5)
+        btn_cfg = dict(bg="#171a1f", fg="#e8e6e1", activebackground="#2a2f37", relief=tk.FLAT, padx=9, pady=5)
+        burst_cfg = dict(bg="#1d352f", fg="#6fd3c2", activebackground="#294c43", relief=tk.FLAT, padx=10, pady=5, font=("Segoe UI", 9, "bold"))
+
+        tk.Button(top, text="★ Open GIF / Burst (True ×2)", command=self.use_gif_or_burst, **burst_cfg).pack(side=tk.LEFT, padx=3)
         tk.Button(top, text="Demo Shake", command=self.use_demo, **btn_cfg).pack(side=tk.LEFT, padx=3)
-        tk.Button(top, text="Live Webcam (Raw)", command=self.use_webcam, **btn_cfg).pack(side=tk.LEFT, padx=3)
+        tk.Button(top, text="Live Webcam (YUY2)", command=self.use_webcam, **btn_cfg).pack(side=tk.LEFT, padx=3)
         tk.Button(top, text="Open Video File", command=self.use_video, **btn_cfg).pack(side=tk.LEFT, padx=3)
-        tk.Button(top, text="Demo With Your Image", command=self.use_image, **btn_cfg).pack(side=tk.LEFT, padx=3)
+        tk.Button(top, text="1:1 Image Crop (Test)", command=self.use_image, **btn_cfg).pack(side=tk.LEFT, padx=3)
 
-        tk.Label(top, text="Lens σ:", fg="#9a9890", bg="#0f1114").pack(side=tk.LEFT, padx=(14, 4))
+        tk.Label(top, text="Lens σ:", fg="#9a9890", bg="#0f1114").pack(side=tk.LEFT, padx=(10, 3))
         self.lens_var = tk.StringVar(value="0.0")
-        lens_box = ttk.Combobox(top, textvariable=self.lens_var, values=["0.0", "0.5", "0.7", "0.9"], width=5, state="readonly")
+        lens_box = ttk.Combobox(top, textvariable=self.lens_var, values=["0.0", "0.3", "0.5", "0.7", "0.9"], width=4, state="readonly")
         lens_box.pack(side=tk.LEFT)
         lens_box.bind("<<ComboboxSelected>>", self.on_lens_change)
 
-        tk.Label(top, text="Zoom:", fg="#9a9890", bg="#0f1114").pack(side=tk.LEFT, padx=(12, 4))
+        tk.Label(top, text="Motion Gate:", fg="#9a9890", bg="#0f1114").pack(side=tk.LEFT, padx=(10, 3))
+        self.gate_var = tk.StringVar(value="Off (Demo)")
+        gate_box = ttk.Combobox(
+            top,
+            textvariable=self.gate_var,
+            values=["Off (Demo)", "Soft (Burst/GIF)", "Strict (Anti-Box/Ghost)"],
+            width=18,
+            state="readonly",
+        )
+        gate_box.pack(side=tk.LEFT)
+
+        tk.Label(top, text="Zoom:", fg="#9a9890", bg="#0f1114").pack(side=tk.LEFT, padx=(10, 3))
         self.zoom_var = tk.StringVar(value="2")
         zoom_box = ttk.Combobox(top, textvariable=self.zoom_var, values=["1", "2", "4"], width=3, state="readonly")
         zoom_box.pack(side=tk.LEFT)
@@ -268,16 +294,16 @@ class TarinaGUI:
         self.freeze_btn = tk.Button(top, text="Freeze", command=self.toggle_freeze, **btn_cfg)
         self.freeze_btn.pack(side=tk.RIGHT, padx=3)
         tk.Button(top, text="Reset", command=self.reset_ring, **btn_cfg).pack(side=tk.RIGHT, padx=3)
-        tk.Button(top, text="Save PNG", command=self.save_png, **btn_cfg).pack(side=tk.RIGHT, padx=3)
+        tk.Button(top, text="Save ×2 PNG", command=self.save_png, **btn_cfg).pack(side=tk.RIGHT, padx=3)
 
         views_frame = tk.Frame(self.root, bg="#0f1114", padx=12, pady=4)
         views_frame.pack(fill=tk.BOTH, expand=True)
 
         self.canvases: list[tk.Canvas] = []
         titles = [
-            "01 / One Frame (First Frame, SihtiSR ×2)",
-            "02 / The Ring (16 Shaky Frames ×2)",
-            "03 / What The Ring Wrote (Residue ×6)",
+            "01 / One Frame (Frame 0, SihtiSR ×2)",
+            "02 / The Ring (Multi-Frame Super-Res ×2)",
+            "03 / What The Ring Wrote (New Detail ×6)",
         ]
         for idx, title in enumerate(titles):
             card = tk.Frame(views_frame, bg="#171a1f", bd=1, relief=tk.SOLID)
@@ -287,6 +313,7 @@ class TarinaGUI:
             cv = tk.Canvas(card, width=HW, height=HH, bg="#000000", highlightthickness=0, cursor="crosshair")
             cv.pack(padx=6, pady=6)
             cv.bind("<Button-1>", self.on_canvas_click)
+            cv.bind("<Button-3>", self.on_right_click_recenter_burst)
             self.canvases.append(cv)
 
         lower = tk.Frame(self.root, bg="#0f1114", padx=12, pady=8)
@@ -325,7 +352,7 @@ class TarinaGUI:
             color = "#6fd3c2" if key == "p_ring" else "#e8e6e1"
             tk.Label(cell, textvariable=v, fg=color, bg="#171a1f", font=("Consolas", 14, "bold")).pack(anchor="w")
 
-        self.msg_var = tk.StringVar(value="Click any canvas to pan the zoom window.")
+        self.msg_var = tk.StringVar(value="Left-click canvas to pan zoom. In GIF/Burst mode, Right-click to shift the 240×180 source window.")
         tk.Label(stats_card, textvariable=self.msg_var, fg="#f2b544", bg="#171a1f", font=("Segoe UI", 10)).grid(
             row=3, column=0, columnspan=3, sticky="w", padx=18, pady=(8, 0)
         )
@@ -346,20 +373,120 @@ class TarinaGUI:
         self.mode = "demo"
         self.lens = 0.0
         self.lens_var.set("0.0")
+        self.gate_var.set("Off (Demo)")
         self.truth = make_chart_truth()
         self.reset_ring()
+
+    def use_gif_or_burst(self):
+        """Load an animated GIF or multiple burst images at 1:1 NATIVE resolution (zero shrinking!) and upscale ×2."""
+        paths = filedialog.askopenfilenames(
+            title="Select an Animated GIF, or select multiple Burst Images (Ctrl+Click)",
+            filetypes=[
+                ("GIF or Burst Images", "*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff"),
+                ("Animated GIF", "*.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        self._stop_capture()
+
+        frames: list[np.ndarray] = []
+        if len(paths) == 1 and paths[0].lower().endswith(".gif"):
+            im = Image.open(paths[0])
+            for frame in ImageSequence.Iterator(im):
+                arr = np.asarray(frame.convert("L"), dtype=np.float64) / 255.0
+                frames.append(arr)
+        else:
+            # Multiple burst files selected (or a single non-GIF file)
+            base_size = None
+            for p in paths:
+                im = Image.open(p)
+                if getattr(im, "n_frames", 1) > 1:
+                    for frame in ImageSequence.Iterator(im):
+                        arr = np.asarray(frame.convert("L"), dtype=np.float64) / 255.0
+                        frames.append(arr)
+                else:
+                    g = im.convert("L")
+                    if base_size is None:
+                        base_size = g.size
+                    elif g.size != base_size:
+                        g = g.resize(base_size, Image.Resampling.BICUBIC)
+                    frames.append(np.asarray(g, dtype=np.float64) / 255.0)
+
+        if len(frames) < 2:
+            self.msg_var.set("Need at least 2 frames in GIF or Burst! (Select an animated .gif or multiple burst photos).")
+            return
+
+        # Pad if smaller than 240x180, otherwise keep exact 1:1 native pixels!
+        fh, fw = frames[0].shape
+        if fh < LH or fw < LW:
+            padded = []
+            for f in frames:
+                py = max(0, LH - f.shape[0])
+                px = max(0, LW - f.shape[1])
+                padded.append(np.pad(f, ((py // 2, py - py // 2), (px // 2, px - px // 2)), mode="edge"))
+            frames = padded
+            fh, fw = frames[0].shape
+
+        self.burst_full_frames = frames
+        self.burst_crop_origin = [(fh - LH) // 2, (fw - LW) // 2]
+        self.burst_idx = 0
+        self.mode = "burst"
+        self.truth = None  # No fake shrinking! We are super-resolving 1:1 native pixels -> 2x!
+        self.lens = 0.5
+        self.lens_var.set("0.5")
+        self.gate_var.set("Soft (Burst/GIF)")
+        self.reset_ring()
+        self.msg_var.set(
+            f"TRUE ×2 BURST/GIF MODE: Loaded {len(frames)} native {fw}×{fh} frames (no shrinking!). "
+            f"Upscaling 240×180 crop -> 480×360. Right-click canvas to move source crop."
+        )
+
+    def on_right_click_recenter_burst(self, event):
+        """In GIF/Burst mode, right-clicking moves the 240x180 native crop window across a larger GIF/burst."""
+        if self.mode != "burst" or not self.burst_full_frames:
+            return
+        fh, fw = self.burst_full_frames[0].shape
+        if fh <= LH and fw <= LW:
+            return
+        ry = event.y / HH
+        rx = event.x / HW
+        y0 = int(max(0, min(fh - LH, round(ry * fh - LH / 2))))
+        x0 = int(max(0, min(fw - LW, round(rx * fw - LW / 2))))
+        self.burst_crop_origin = [y0, x0]
+        self.reset_ring()
+        self.msg_var.set(f"Moved 1:1 native burst crop to ({x0}, {y0}) in {fw}×{fh} sequence — rebuilding ×2 ring.")
+
+    def next_burst_frame(self) -> np.ndarray | None:
+        if not self.burst_full_frames:
+            return None
+        f = self.burst_full_frames[self.burst_idx % len(self.burst_full_frames)]
+        self.burst_idx += 1
+        y0, x0 = self.burst_crop_origin
+        return f[y0 : y0 + LH, x0 : x0 + LW].copy()
 
     def use_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.webp")])
         if not path:
             return
         self._stop_capture()
-        im = Image.open(path).convert("L").resize((HW, HH), Image.Resampling.BICUBIC)
-        self.truth = np.asarray(im, dtype=np.float64) / 255.0
+        full_im = Image.open(path).convert("L")
+        fw, fh = full_im.size
+        if fw < HW or fh < HH:
+            crop = full_im.resize((HW, HH), Image.Resampling.BICUBIC)
+        else:
+            cx, cy = fw // 2, fh // 2
+            x0 = max(0, min(fw - HW, cx - HW // 2))
+            y0 = max(0, min(fh - HH, cy - HH // 2))
+            crop = full_im.crop((x0, y0, x0 + HW, y0 + HH))
+        self.truth = np.asarray(crop, dtype=np.float64) / 255.0
         self.mode = "demo"
         self.lens = 0.0
         self.lens_var.set("0.0")
+        self.gate_var.set("Off (Demo)")
         self.reset_ring()
+        self.msg_var.set(f"1:1 Native {HW}×{HH} crop from {fw}×{fh} image (test shrinks to {LW}×{LH} and recovers {HW}×{HH}).")
 
     def use_webcam(self):
         self._stop_capture()
@@ -369,15 +496,17 @@ class TarinaGUI:
         if not cap.isOpened():
             self.msg_var.set("Could not open webcam.")
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUY2"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap = cap
         self.mode = "cam"
         self.truth = None
-        self.lens = 0.7
-        self.lens_var.set("0.7")
+        self.lens = 0.3
+        self.lens_var.set("0.3")
+        self.gate_var.set("Strict (Anti-Box/Ghost)")
         self.reset_ring()
-        self.msg_var.set("Webcam active: center 240×180 native sensor crop. Hold camera or object in hand for micro-shake.")
+        self.msg_var.set("Webcam YUY2 active (Motion Gate = Strict). Rejects large motion & frame-border boxes.")
 
     def use_video(self):
         path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4;*.mov;*.avi;*.mkv;*.webm")])
@@ -387,8 +516,9 @@ class TarinaGUI:
         self.cap = cv2.VideoCapture(path)
         self.mode = "video"
         self.truth = None
-        self.lens = 0.7
-        self.lens_var.set("0.7")
+        self.lens = 0.5
+        self.lens_var.set("0.5")
+        self.gate_var.set("Soft (Burst/GIF)")
         self.reset_ring()
 
     def _stop_capture(self):
@@ -402,6 +532,7 @@ class TarinaGUI:
         self.bic = None
         self.last_frame = None
         self.demo_t = 0
+        self.burst_idx = 0
         self.written = 0
         self.skipped = 0
         self.misses = 0
@@ -446,7 +577,6 @@ class TarinaGUI:
         return lum.astype(np.float64)
 
     def _create_ring(self, ref: np.ndarray, x0: np.ndarray):
-        """Instantiate tarina.Ring regardless of keyword vs dict options signature."""
         try:
             return tarina.Ring(ref, x0, min_peak=0.03, lens=self.lens)
         except TypeError:
@@ -475,15 +605,34 @@ class TarinaGUI:
         self.last_frame = y
 
         y_in = match_exposure(self.ring.ref, y) if self.mode != "demo" else y
+        prev_x = self.ring.x.copy()
         m = self.ring.step(y_in)
+
+        gate_mode = self.gate_var.get()
+        if m is not None and gate_mode != "Off (Demo)":
+            max_shift = 5.0 if "Strict" in gate_mode else 9.0
+            max_rot = 0.025 if "Strict" in gate_mode else 0.05
+            if math.hypot(m[0], m[1]) > max_shift or abs(m[2]) > max_rot:
+                self.ring.x = prev_x
+                m = None
+
         if m is None:
             self.skipped += 1
             self.misses += 1
-            if self.misses > 15 and self.mode != "demo":
-                self.msg_var.set("Lost reference lock — restarting ring from current frame.")
+            if self.misses > 15 and self.mode in ("cam", "video"):
+                self.msg_var.set("Scene changed — resetting ring to new keyframe.")
                 self.ring = None
                 self.feed_frame(y)
             return
+
+        if gate_mode != "Off (Demo)" and self.x0 is not None:
+            step_delta = (self.ring.x - prev_x) * FEATHER_HR
+            thr = 0.025 if "Strict" in gate_mode else 0.055
+            weight = np.exp(-((step_delta / thr) ** 4))
+            self.ring.x = prev_x + step_delta * weight
+            total_diff = self.ring.x - self.x0
+            drift_mask = np.exp(-((total_diff / (thr * 3.5)) ** 4))
+            self.ring.x = self.x0 + total_diff * FEATHER_HR * drift_mask
 
         self.misses = 0
         self.written += 1
@@ -552,11 +701,11 @@ class TarinaGUI:
     def save_png(self):
         if self.ring is None:
             return
-        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile="tarinasr_python.png")
+        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile="tarinasr_superres_2x.png")
         if path:
             u8 = np.clip(self.ring.x * 255.0, 0, 255).astype(np.uint8)
             Image.fromarray(u8).save(path)
-            self.msg_var.set(f"Saved {path}")
+            self.msg_var.set(f"Saved ×2 super-resolved image to {path}")
 
     def tick(self):
         if not self.frozen:
@@ -565,6 +714,15 @@ class TarinaGUI:
                 y = self.next_demo_frame()
                 if self.demo_t == DEMO_FRAMES:
                     self.msg_var.set(f"Done: {DEMO_FRAMES} shaky frames. Press Reset to run again.")
+            elif self.mode == "burst":
+                # Stop after 4 laps through the GIF/burst so it converges cleanly
+                max_steps = max(64, len(self.burst_full_frames) * 4)
+                if self.burst_idx < max_steps:
+                    y = self.next_burst_frame()
+                    if self.burst_idx == max_steps:
+                        self.msg_var.set(
+                            f"Burst/GIF converged ({self.written} frames fused into ×2 Super-Res). Click Reset to replay."
+                        )
             elif self.mode in ("cam", "video"):
                 y = self.next_capture_frame()
 
